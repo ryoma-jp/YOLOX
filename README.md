@@ -73,6 +73,16 @@ cd YOLOX
 pip3 install -v -e .  # or  python3 setup.py develop
 ```
 
+Option. Running on Docker conitainer
+```shell
+./scripts/make_env.sh
+docker compose -d --build
+docker compose exec yolox bash
+ln -s /dataset/<your-coco-dataset-path> ./datasets/COCO
+wget -P weights/ https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.pth
+./scripts/run_eval_yolox-s.sh
+```
+
 </details>
 
 <details>

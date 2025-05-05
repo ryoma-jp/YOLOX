@@ -1,0 +1,30 @@
+
+services:
+  yolox:
+    build:
+      context: "./docker"
+      dockerfile: "Dockerfile"
+      args:
+        USER_ID: ${UID}
+        GROUP_ID: ${GID}
+        USER_NAME: ${UNAME}
+    shm_size: '2g'
+    tty: true
+    stdin_open: true
+    volumes:
+      - type: bind
+        source: "."
+        target: "/workspace"
+      - type: bind
+        source: ${HOME}/work/dataset
+        target: /dataset
+    working_dir: "/workspace"
+    user: "${UID}:${GID}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids: ['0']
+            capabilities: [gpu]
+
