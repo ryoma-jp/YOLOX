@@ -230,8 +230,6 @@ python -m yolox.tools.eval -n  yolox-s -c yolox_s.pth -b 1 -d 1 --conf 0.001 --f
 
 The current file output is designed as a base for future extensibility.
 Planned additions include:
-* add WriterManager to unify registration and execution of multiple writers.
-* extend PredictionWriter JSON schema with image_id-based index and lightweight summary statistics.
 * add FeatureMapWriter with the same interface, including options for layer selection, max image count, and output format.
 
 </details>

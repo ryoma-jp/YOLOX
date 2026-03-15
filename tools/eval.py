@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from yolox.core import launch
 from yolox.exp import get_exp
-from yolox.evaluators import PredictionWriter, SummaryWriter
+from yolox.evaluators import PredictionWriter, SummaryWriter, WriterManager
 from yolox.utils import (
     configure_module,
     configure_nccl,
@@ -241,16 +241,21 @@ def main(exp, args, num_gpu):
             "timestamp": datetime.now().isoformat(),
         }
 
-        summary_writer = SummaryWriter(eval_out_dir)
-        summary_artifacts = summary_writer.write(summary, ap50_95, ap50, metadata=metadata)
-        logger.info("Saved evaluation summary to {} and {}".format(
-            summary_artifacts["summary_path"], summary_artifacts["metrics_path"]
-        ))
+        manager = WriterManager(eval_out_dir)
+        manager.register("summary", SummaryWriter(eval_out_dir))
+        if args.save_predictions:
+            manager.register("predictions", PredictionWriter(eval_out_dir))
 
-        if args.save_predictions and output_data is not None:
-            prediction_writer = PredictionWriter(eval_out_dir)
-            prediction_artifacts = prediction_writer.write(output_data, metadata=metadata)
-            logger.info("Saved evaluation predictions to {}".format(prediction_artifacts["predictions_path"]))
+        all_artifacts = manager.write_all(
+            summary=summary,
+            ap50_95=ap50_95,
+            ap50=ap50,
+            predictions=output_data,
+            metadata=metadata,
+        )
+        for writer_name, artifacts in all_artifacts.items():
+            for artifact_key, path in artifacts.items():
+                logger.info("Saved [{}] {} to {}".format(writer_name, artifact_key, path))
 
 
 if __name__ == "__main__":
