@@ -46,6 +46,12 @@ def make_parser():
         help="confidence threshold for drawing boxes",
     )
     parser.add_argument(
+        "--nms-iou-threshold",
+        type=float,
+        default=0.5,
+        help="IoU threshold for per-class NMS. Set a negative value to disable NMS.",
+    )
+    parser.add_argument(
         "--mode",
         type=str,
         default="boxes",
@@ -117,14 +123,85 @@ def _category_color(category_id: int):
     return int(b), int(g), int(r)
 
 
-def _draw_boxes(image: np.ndarray, pred: dict, conf_threshold: float):
-    boxes = pred.get("bboxes", [])
-    scores = pred.get("scores", [])
-    categories = pred.get("categories", [])
+def _box_iou_xyxy(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    x0 = max(float(box_a[0]), float(box_b[0]))
+    y0 = max(float(box_a[1]), float(box_b[1]))
+    x1 = min(float(box_a[2]), float(box_b[2]))
+    y1 = min(float(box_a[3]), float(box_b[3]))
 
-    for box, score, category_id in zip(boxes, scores, categories):
-        if float(score) < conf_threshold:
-            continue
+    inter_w = max(0.0, x1 - x0)
+    inter_h = max(0.0, y1 - y0)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0.0:
+        return 0.0
+
+    area_a = max(0.0, float(box_a[2]) - float(box_a[0])) * max(0.0, float(box_a[3]) - float(box_a[1]))
+    area_b = max(0.0, float(box_b[2]) - float(box_b[0])) * max(0.0, float(box_b[3]) - float(box_b[1]))
+    union = area_a + area_b - inter_area
+    if union <= 0.0:
+        return 0.0
+    return inter_area / union
+
+
+def _nms_indices_per_class(boxes: np.ndarray, scores: np.ndarray, categories: np.ndarray, iou_threshold: float):
+    if boxes.size == 0:
+        return np.array([], dtype=np.int64)
+
+    keep_indices = []
+    unique_categories = np.unique(categories)
+
+    for category_id in unique_categories:
+        category_mask = categories == category_id
+        category_indices = np.where(category_mask)[0]
+        category_scores = scores[category_mask]
+        order = category_indices[np.argsort(-category_scores)]
+
+        while order.size > 0:
+            current = int(order[0])
+            keep_indices.append(current)
+
+            if order.size == 1:
+                break
+
+            remaining = order[1:]
+            ious = np.array([_box_iou_xyxy(boxes[current], boxes[idx]) for idx in remaining], dtype=np.float32)
+            order = remaining[ious <= iou_threshold]
+
+    return np.array(sorted(keep_indices), dtype=np.int64)
+
+
+def _filter_predictions_for_draw(pred: dict, conf_threshold: float, nms_iou_threshold: float):
+    boxes = np.asarray(pred.get("bboxes", []), dtype=np.float32)
+    scores = np.asarray(pred.get("scores", []), dtype=np.float32)
+    categories = np.asarray(pred.get("categories", []), dtype=np.int32)
+
+    if boxes.ndim != 2 or boxes.shape[1] != 4:
+        return []
+    if scores.ndim != 1 or categories.ndim != 1:
+        return []
+    if not (len(boxes) == len(scores) == len(categories)):
+        return []
+
+    conf_mask = scores >= float(conf_threshold)
+    boxes = boxes[conf_mask]
+    scores = scores[conf_mask]
+    categories = categories[conf_mask]
+    if boxes.size == 0:
+        return []
+
+    if nms_iou_threshold >= 0.0:
+        keep = _nms_indices_per_class(boxes, scores, categories, float(nms_iou_threshold))
+        boxes = boxes[keep]
+        scores = scores[keep]
+        categories = categories[keep]
+
+    return list(zip(boxes.tolist(), scores.tolist(), categories.tolist()))
+
+
+def _draw_boxes(image: np.ndarray, pred: dict, conf_threshold: float, nms_iou_threshold: float):
+    filtered_predictions = _filter_predictions_for_draw(pred, conf_threshold, nms_iou_threshold)
+
+    for box, score, category_id in filtered_predictions:
         if len(box) != 4:
             continue
 
@@ -166,7 +243,7 @@ def _render_boxes_mode(predictions: Dict[str, dict], images_meta: Dict[str, dict
             logger.warning("Skip image_id={} because source image was not found: {}", image_id_key, image_path)
             continue
 
-        vis_image = _draw_boxes(image, pred, args.conf_threshold)
+        vis_image = _draw_boxes(image, pred, args.conf_threshold, args.nms_iou_threshold)
         safe_file_name = os.path.basename(file_name)
         out_name = "{}_{}".format(image_id_key, safe_file_name)
         out_path = os.path.join(args.output_dir, out_name)

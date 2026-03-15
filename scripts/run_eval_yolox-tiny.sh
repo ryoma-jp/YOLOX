@@ -14,6 +14,8 @@ if [ "$EVAL_MODE" = "file" ]; then
     docker compose run --rm yolox \
         python tools/visualize_eval_results.py \
             --predictions-path YOLOX_outputs/yolox_tiny/eval/predictions.json \
+            --conf-threshold 0.3 \
+            --nms-iou-threshold 0.5 \
             --images-dir datasets/COCO/val2017 \
             --output-dir YOLOX_outputs/yolox_tiny/eval/vis_res \
             --image-id 397133
