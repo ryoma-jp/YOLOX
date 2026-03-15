@@ -171,6 +171,7 @@ def main(exp, args, num_gpu):
     torch.cuda.set_device(rank)
     model.cuda(rank)
     model.eval()
+    loaded_ckpt_path = None
 
     if not args.speed and not args.trt:
         if args.ckpt is None:
@@ -181,6 +182,7 @@ def main(exp, args, num_gpu):
         loc = "cuda:{}".format(rank)
         ckpt = torch.load(ckpt_file, map_location=loc)
         model.load_state_dict(ckpt["model"])
+        loaded_ckpt_path = ckpt_file
         logger.info("loaded checkpoint done.")
 
     if is_distributed:
@@ -230,14 +232,20 @@ def main(exp, args, num_gpu):
     if rank == 0 and eval_out_dir is not None:
         metadata = {
             "experiment_name": args.experiment_name,
+            "model_family": "yolox",
             "exp_file": args.exp_file,
-            "checkpoint": args.ckpt,
+            "checkpoint": loaded_ckpt_path,
             "batch_size": args.batch_size,
             "devices": args.devices,
             "testdev": args.test,
             "conf": exp.test_conf,
             "nms": exp.nmsthre,
+            "num_classes": exp.num_classes,
             "test_size": list(exp.test_size),
+            "preprocess": {
+                "legacy": bool(args.legacy),
+            },
+            "feature_export_policy": "yolox_default_v1",
             "timestamp": datetime.now().isoformat(),
         }
 

@@ -12,12 +12,14 @@ if [ "$EVAL_MODE" = "file" ]; then
 		$BASE_CMD --eval-out "$EVAL_OUT_DIR" --save-predictions
     
     docker compose run --rm yolox \
-        python tools/visualize_eval_results.py \
+        python -m tools.visualize_eval_results \
             --predictions-path YOLOX_outputs/yolox_tiny/eval/predictions.json \
             --conf-threshold 0.3 \
             --nms-iou-threshold 0.5 \
             --images-dir datasets/COCO/val2017 \
             --annotations-path datasets/COCO/annotations/instances_val2017.json \
+            --exp-file exps/default/yolox_tiny.py \
+            --ckpt weights/yolox_tiny.pth \
             --output-dir YOLOX_outputs/yolox_tiny/eval/vis_res \
             --image-id 397133
 else

@@ -48,6 +48,10 @@ class PredictionWriter(EvaluationWriter):
 
     Schema version 3 adds:
     - images: top-level image metadata map keyed by image_id.
+
+        Schema version 4 adds:
+        - metadata fields used by visualize_eval_results.py to rerun inference
+            for feature export (e.g., model_family, exp_file, checkpoint, test_size).
     """
 
     def write(self, predictions, metadata=None):
@@ -89,7 +93,7 @@ class PredictionWriter(EvaluationWriter):
         }
 
         payload = {
-            "schema_version": 3,
+            "schema_version": 4,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
             "summary_stats": summary_stats,

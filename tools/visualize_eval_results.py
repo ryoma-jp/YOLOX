@@ -4,13 +4,22 @@
 import argparse
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
 from loguru import logger
 
-EXPECTED_SCHEMA_VERSION = 3
+EXPECTED_SCHEMA_VERSION = 4
+
+DEFAULT_YOLOX_LAYER_MAPPING = {
+    "backbone_s8": "backbone.backbone.dark3",
+    "backbone_s16": "backbone.backbone.dark4",
+    "backbone_s32": "backbone.backbone.dark5",
+    "neck_s8": "backbone.C3_p3",
+    "neck_s16": "backbone.C3_n3",
+    "neck_s32": "backbone.C3_n4",
+}
 
 
 def make_parser():
@@ -63,17 +72,31 @@ def make_parser():
         type=str,
         default="boxes",
         choices=["boxes", "features", "both"],
-        help="visualization mode. features/both are reserved for future extension",
+        help="kept for backward compatibility. feature npy export is always enabled.",
     )
-    # Reserved for future feature-map extraction mode that reruns inference.
-    parser.add_argument("--exp-file", type=str, default=None, help="reserved for mode=features|both")
-    parser.add_argument("--ckpt", type=str, default=None, help="reserved for mode=features|both")
-    parser.add_argument("--device", type=str, default="cpu", help="reserved for mode=features|both")
+    parser.add_argument(
+        "--exp-file",
+        type=str,
+        default=None,
+        help="path to experiment file used to build model for feature export",
+    )
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        default=None,
+        help="path to checkpoint (.pth) used to rerun inference for feature export",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help="device for rerun inference (e.g. cpu, cuda, cuda:0)",
+    )
     parser.add_argument(
         "--feature-layers",
         nargs="*",
         default=None,
-        help="reserved for mode=features|both: feature layer names to export",
+        help="optional logical layer names to export. default: all standard YOLOX feature layers",
     )
     return parser
 
@@ -135,6 +158,154 @@ def _resolve_image_path(images_dir: str, image_id_key: str, pred: dict, images_m
 
     image_path = os.path.join(images_dir, file_name)
     return image_path, file_name
+
+
+def _resolve_runtime_config(payload: dict, args) -> dict:
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    preprocess_meta = metadata.get("preprocess", {}) if isinstance(metadata, dict) else {}
+
+    exp_file = args.exp_file or metadata.get("exp_file")
+    ckpt = args.ckpt or metadata.get("checkpoint")
+    test_size = metadata.get("test_size")
+    model_family = metadata.get("model_family", "yolox")
+    legacy = bool(preprocess_meta.get("legacy", False))
+
+    if not exp_file:
+        raise ValueError(
+            "Unable to resolve exp file. Provide --exp-file or regenerate predictions.json with schema v4 metadata."
+        )
+    if not ckpt:
+        raise ValueError(
+            "Unable to resolve checkpoint path. Provide --ckpt or regenerate predictions.json with schema v4 metadata."
+        )
+
+    return {
+        "model_family": str(model_family),
+        "exp_file": str(exp_file),
+        "ckpt": str(ckpt),
+        "device": str(args.device),
+        "test_size": test_size,
+        "legacy": legacy,
+    }
+
+
+def _resolve_layer_mapping(model_family: str, selected_layers: List[str]) -> Dict[str, str]:
+    if model_family != "yolox":
+        raise NotImplementedError("model_family='{}' is not supported yet".format(model_family))
+
+    base_mapping = dict(DEFAULT_YOLOX_LAYER_MAPPING)
+    if not selected_layers:
+        return base_mapping
+
+    unknown = [name for name in selected_layers if name not in base_mapping]
+    if unknown:
+        raise KeyError("Unknown feature layer names: {}".format(", ".join(unknown)))
+
+    return {name: base_mapping[name] for name in selected_layers}
+
+
+def _load_model_for_feature_export(runtime_cfg: dict):
+    import torch
+    from yolox.data.data_augment import ValTransform
+    from yolox.exp import get_exp
+
+    exp = get_exp(runtime_cfg["exp_file"], None)
+    model = exp.get_model()
+
+    ckpt = torch.load(runtime_cfg["ckpt"], map_location="cpu")
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        ckpt = ckpt["model"]
+    model.load_state_dict(ckpt)
+
+    test_size = runtime_cfg.get("test_size")
+    if isinstance(test_size, list) and len(test_size) == 2:
+        test_size = (int(test_size[0]), int(test_size[1]))
+    else:
+        test_size = tuple(exp.test_size)
+
+    device = torch.device(runtime_cfg["device"])
+    model.to(device)
+    model.eval()
+
+    preproc = ValTransform(legacy=runtime_cfg.get("legacy", False))
+    return model, preproc, test_size, torch, device
+
+
+def _register_feature_hooks(model, layer_mapping: Dict[str, str]):
+    feature_cache = {}
+    handles = []
+    module_dict = dict(model.named_modules())
+
+    missing = [module_name for module_name in layer_mapping.values() if module_name not in module_dict]
+    if missing:
+        raise KeyError(
+            "Failed to find feature layers in model.named_modules(): {}".format(", ".join(missing))
+        )
+
+    for logical_name, module_name in layer_mapping.items():
+        module = module_dict[module_name]
+
+        def _hook(_, __, output, logical_name_=logical_name, module_name_=module_name):
+            tensor = output[0] if isinstance(output, (list, tuple)) else output
+            if tensor is None or not hasattr(tensor, "detach"):
+                return
+            feature_cache[logical_name_] = {
+                "module_name": module_name_,
+                "tensor": tensor.detach().cpu(),
+            }
+
+        handles.append(module.register_forward_hook(_hook))
+
+    return handles, feature_cache
+
+
+def _prepare_model_input(image: np.ndarray, preproc, test_size: Tuple[int, int], torch, device):
+    processed, _ = preproc(image, None, test_size)
+    model_input = torch.from_numpy(processed).unsqueeze(0).float().to(device)
+    return model_input
+
+
+def _save_feature_arrays(
+    per_image_dir: str,
+    image_id_key: str,
+    file_name: str,
+    feature_cache: Dict[str, dict],
+    model_input_shape: Tuple[int, ...],
+):
+    npy_dir = os.path.join(per_image_dir, "npy")
+    os.makedirs(npy_dir, exist_ok=True)
+
+    manifest = {
+        "image_id": image_id_key,
+        "file_name": file_name,
+        "model_input_shape": list(model_input_shape),
+        "layers": [],
+    }
+
+    for logical_name in sorted(feature_cache.keys()):
+        item = feature_cache[logical_name]
+        tensor = item["tensor"]
+        if tensor.ndim == 4 and tensor.shape[0] == 1:
+            tensor = tensor[0]
+
+        array = tensor.float().numpy()
+        file_base = "feat_{}.npy".format(logical_name)
+        file_path = os.path.join(npy_dir, file_base)
+        np.save(file_path, array)
+
+        manifest["layers"].append(
+            {
+                "logical_name": logical_name,
+                "module_name": item["module_name"],
+                "tensor_path": os.path.join("npy", file_base),
+                "shape": list(array.shape),
+                "dtype": str(array.dtype),
+            }
+        )
+
+    manifest_path = os.path.join(per_image_dir, "feature_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
 
 
 def _category_color(category_id: int):
@@ -289,6 +460,12 @@ def _render_boxes_mode(
     images_meta: Dict[str, dict],
     image_ids: List[str],
     gt_index: Dict[str, List[dict]],
+    model,
+    preproc,
+    test_size: Tuple[int, int],
+    torch,
+    device,
+    layer_mapping: Dict[str, str],
     args,
 ):
     rendered_count = 0
@@ -321,17 +498,28 @@ def _render_boxes_mode(
             gt_path = os.path.join(per_image_dir, "gt_{}".format(safe_file_name))
             cv2.imwrite(gt_path, gt_image)
 
+        hook_handles, feature_cache = _register_feature_hooks(model, layer_mapping)
+        model_input = None
+        try:
+            model_input = _prepare_model_input(image, preproc, test_size, torch, device)
+            with torch.no_grad():
+                _ = model(model_input)
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+
+        if model_input is not None:
+            _save_feature_arrays(
+                per_image_dir=per_image_dir,
+                image_id_key=image_id_key,
+                file_name=safe_file_name,
+                feature_cache=feature_cache,
+                model_input_shape=tuple(model_input.shape),
+            )
+
         rendered_count += 1
 
-    logger.info("Rendered {} images into {}", rendered_count, args.output_dir)
-
-
-def _render_feature_mode_placeholder(args):
-    raise NotImplementedError(
-        "mode='{}' is reserved for future extension. "
-        "Planned behavior: rerun inference for the selected image_id and export intermediate feature maps."
-        .format(args.mode)
-    )
+    logger.info("Rendered {} images with detection overlays and feature npy into {}", rendered_count, args.output_dir)
 
 
 def main():
@@ -347,12 +535,26 @@ def main():
         gt_index = _load_annotations(args.annotations_path)
         logger.info("Loaded GT annotations from {}", args.annotations_path)
 
-    if args.mode == "boxes":
-        _render_boxes_mode(predictions, images_meta, image_ids, gt_index, args)
-        return
+    runtime_cfg = _resolve_runtime_config(payload, args)
+    layer_mapping = _resolve_layer_mapping(runtime_cfg["model_family"], args.feature_layers)
+    model, preproc, test_size, torch, device = _load_model_for_feature_export(runtime_cfg)
 
-    # Keep extension hook explicit: feature modes are model-dependent and may rerun inference.
-    _render_feature_mode_placeholder(args)
+    if args.mode != "boxes":
+        logger.info("mode='{}' requested. Detection overlays and feature npy export are both enabled.", args.mode)
+
+    _render_boxes_mode(
+        predictions=predictions,
+        images_meta=images_meta,
+        image_ids=image_ids,
+        gt_index=gt_index,
+        model=model,
+        preproc=preproc,
+        test_size=test_size,
+        torch=torch,
+        device=device,
+        layer_mapping=layer_mapping,
+        args=args,
+    )
 
 
 if __name__ == "__main__":

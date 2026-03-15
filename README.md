@@ -210,15 +210,18 @@ python -m yolox.tools.eval -n yolox-s -c yolox_s.pth -b 64 -d 8 --conf 0.001 --e
 
 New options:
 * --eval-out: output directory for evaluation artifacts.
-* --save-predictions: save image-wise predictions to `predictions.json` under `--eval-out`.
+* --save-predictions: save image-wise predictions to `predictions.json` under `--eval-out` (schema v4, including metadata for feature-export replay).
 
-You can render detection overlays from `predictions.json` after evaluation:
+You can render detection overlays from `predictions.json` after evaluation.
+`tools/visualize_eval_results.py` now also reruns inference and always exports intermediate feature tensors as `.npy` files:
 
 ```shell
 python tools/visualize_eval_results.py \
   --predictions-path YOLOX_outputs/yolox_s/eval/predictions.json \
   --images-dir datasets/COCO/val2017 \
   --output-dir YOLOX_outputs/yolox_s/eval/vis_res \
+  --exp-file exps/default/yolox_s.py \
+  --ckpt weights/yolox_s.pth \
   --image-id 397133
 ```
 
@@ -229,6 +232,8 @@ python tools/visualize_eval_results.py \
   --predictions-path YOLOX_outputs/yolox_s/eval/predictions.json \
   --images-dir datasets/COCO/val2017 \
   --output-dir YOLOX_outputs/yolox_s/eval/vis_res_all \
+  --exp-file exps/default/yolox_s.py \
+  --ckpt weights/yolox_s.pth \
   --image-id -1
 ```
 
@@ -239,14 +244,38 @@ docker compose run --rm yolox python tools/visualize_eval_results.py \
   --predictions-path YOLOX_outputs/yolox_s/eval/predictions.json \
   --images-dir datasets/COCO/val2017 \
   --output-dir YOLOX_outputs/yolox_s/eval/vis_res \
+  --exp-file exps/default/yolox_s.py \
+  --ckpt weights/yolox_s.pth \
   --image-id 397133
 ```
 
 Additional options:
 * --conf-threshold: skip drawing detections whose score is lower than the threshold.
-* --mode: currently `boxes` is implemented. `features` and `both` are reserved for future extension where the selected `image_id` may be re-inferred to export intermediate feature maps.
+* --nms-iou-threshold: IoU threshold for per-class NMS on drawn detections.
+* --exp-file / --ckpt: required for feature export unless these are already present in `predictions.json` metadata (schema v4).
+* --device: device for feature-export inference (`cpu`, `cuda`, `cuda:0`, ...).
+* --feature-layers: optional logical feature layer names. Defaults to all standard YOLOX layers (`backbone_s8`, `backbone_s16`, `backbone_s32`, `neck_s8`, `neck_s16`, `neck_s32`).
+* --mode: kept for backward compatibility. Feature `.npy` export is always enabled.
 
-By default (without these options), behavior is unchanged and results are printed/logged as before.
+Per image, outputs are organized as:
+
+```text
+{output_dir}/{image_id}/
+  det_{filename}
+  gt_{filename}            # only when --annotations-path is provided
+  feature_manifest.json
+  npy/
+    feat_backbone_s8.npy
+    feat_backbone_s16.npy
+    feat_backbone_s32.npy
+    feat_neck_s8.npy
+    feat_neck_s16.npy
+    feat_neck_s32.npy
+```
+
+`feature_manifest.json` stores the mapping between logical layer names and saved `.npy` tensors (module name, shape, dtype, and relative path).
+
+Without optional filtering flags, the script writes detection overlays plus feature tensors for selected image ids.
 
 When using `scripts/run_eval_yolox-tiny.sh`, you can switch mode with `EVAL_MODE`:
 * `EVAL_MODE=""`: standard output/log only (default).
