@@ -211,8 +211,20 @@ class COCOEvaluator:
         for (output, img_h, img_w, img_id) in zip(
             outputs, info_imgs[0], info_imgs[1], ids
         ):
+            image_id = int(img_id)
+            img_meta = self.dataloader.dataset.coco.loadImgs(image_id)[0]
+            image_wise_data[image_id] = {
+                "file_name": img_meta.get("file_name", ""),
+                "width": int(img_meta.get("width", img_w)),
+                "height": int(img_meta.get("height", img_h)),
+                "bboxes": [],
+                "scores": [],
+                "categories": [],
+            }
+
             if output is None:
                 continue
+
             output = output.cpu()
 
             bboxes = output[:, 0:4]
@@ -225,23 +237,19 @@ class COCOEvaluator:
             cls = output[:, 6]
             scores = output[:, 4] * output[:, 5]
 
-            image_wise_data.update({
-                int(img_id): {
-                    "bboxes": [box.numpy().tolist() for box in bboxes],
-                    "scores": [score.numpy().item() for score in scores],
-                    "categories": [
-                        self.dataloader.dataset.class_ids[int(cls[ind])]
-                        for ind in range(bboxes.shape[0])
-                    ],
-                }
-            })
+            image_wise_data[image_id]["bboxes"] = [box.numpy().tolist() for box in bboxes]
+            image_wise_data[image_id]["scores"] = [score.numpy().item() for score in scores]
+            image_wise_data[image_id]["categories"] = [
+                self.dataloader.dataset.class_ids[int(cls[ind])]
+                for ind in range(bboxes.shape[0])
+            ]
 
             bboxes = xyxy2xywh(bboxes)
 
             for ind in range(bboxes.shape[0]):
                 label = self.dataloader.dataset.class_ids[int(cls[ind])]
                 pred_data = {
-                    "image_id": int(img_id),
+                    "image_id": image_id,
                     "category_id": label,
                     "bbox": bboxes[ind].numpy().tolist(),
                     "score": scores[ind].numpy().item(),

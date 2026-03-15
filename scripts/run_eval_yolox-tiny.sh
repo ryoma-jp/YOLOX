@@ -10,6 +10,13 @@ if [ "$EVAL_MODE" = "file" ]; then
     rm -rf "$EVAL_OUT_DIR"/*
 	docker compose run --rm yolox \
 		$BASE_CMD --eval-out "$EVAL_OUT_DIR" --save-predictions
+    
+    docker compose run --rm yolox \
+        python tools/visualize_eval_results.py \
+            --predictions-path YOLOX_outputs/yolox_tiny/eval/predictions.json \
+            --images-dir datasets/COCO/val2017 \
+            --output-dir YOLOX_outputs/yolox_tiny/eval/vis_res \
+            --image-id 397133
 else
 	docker compose run --rm yolox \
 		$BASE_CMD

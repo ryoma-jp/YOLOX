@@ -45,6 +45,9 @@ class PredictionWriter(EvaluationWriter):
     Schema version 2 adds:
     - image_index: ordered mapping of image_id -> sequential index.
     - summary_stats: lightweight aggregate statistics over all predictions.
+
+    Schema version 3 adds:
+    - images: top-level image metadata map keyed by image_id.
     """
 
     def write(self, predictions, metadata=None):
@@ -58,7 +61,10 @@ class PredictionWriter(EvaluationWriter):
         total_detections = 0
         all_scores = []
         per_category_counts = {}
-        for pred in predictions.values():
+        images = {}
+        for image_id, pred in predictions.items():
+            if not isinstance(pred, dict):
+                continue
             scores = pred.get("scores", [])
             if scores:
                 images_with_detections += 1
@@ -67,6 +73,12 @@ class PredictionWriter(EvaluationWriter):
             for cat in pred.get("categories", []):
                 key = str(cat)
                 per_category_counts[key] = per_category_counts.get(key, 0) + 1
+
+            images[str(image_id)] = {
+                "file_name": pred.get("file_name", ""),
+                "width": pred.get("width"),
+                "height": pred.get("height"),
+            }
 
         summary_stats = {
             "total_images": total_images,
@@ -77,11 +89,12 @@ class PredictionWriter(EvaluationWriter):
         }
 
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
             "summary_stats": summary_stats,
             "image_index": image_index,
+            "images": images,
             "predictions": {str(k): v for k, v in predictions.items()},
         }
         predictions_path = os.path.join(self.output_dir, "predictions.json")

@@ -212,6 +212,40 @@ New options:
 * --eval-out: output directory for evaluation artifacts.
 * --save-predictions: save image-wise predictions to `predictions.json` under `--eval-out`.
 
+You can render detection overlays from `predictions.json` after evaluation:
+
+```shell
+python tools/visualize_eval_results.py \
+  --predictions-path YOLOX_outputs/yolox_s/eval/predictions.json \
+  --images-dir datasets/COCO/val2017 \
+  --output-dir YOLOX_outputs/yolox_s/eval/vis_res \
+  --image-id 397133
+```
+
+To render all image ids stored in `predictions.json`, specify `--image-id -1`:
+
+```shell
+python tools/visualize_eval_results.py \
+  --predictions-path YOLOX_outputs/yolox_s/eval/predictions.json \
+  --images-dir datasets/COCO/val2017 \
+  --output-dir YOLOX_outputs/yolox_s/eval/vis_res_all \
+  --image-id -1
+```
+
+If you are using the Docker service in this repository, run the same command through `yolox`:
+
+```shell
+docker compose run --rm yolox python tools/visualize_eval_results.py \
+  --predictions-path YOLOX_outputs/yolox_s/eval/predictions.json \
+  --images-dir datasets/COCO/val2017 \
+  --output-dir YOLOX_outputs/yolox_s/eval/vis_res \
+  --image-id 397133
+```
+
+Additional options:
+* --conf-threshold: skip drawing detections whose score is lower than the threshold.
+* --mode: currently `boxes` is implemented. `features` and `both` are reserved for future extension where the selected `image_id` may be re-inferred to export intermediate feature maps.
+
 By default (without these options), behavior is unchanged and results are printed/logged as before.
 
 When using `scripts/run_eval_yolox-tiny.sh`, you can switch mode with `EVAL_MODE`:
