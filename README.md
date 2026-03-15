@@ -194,6 +194,30 @@ python -m yolox.tools.eval -n  yolox-s -c yolox_s.pth -b 64 -d 8 --conf 0.001 [-
 * -d: number of GPUs used for evaluation. DEFAULT: All GPUs available will be used.
 * -b: total batch size across on all GPUs
 
+### Extended evaluation output (optional)
+
+As an extension, evaluation artifacts can be saved to a directory.
+
+```shell
+python -m yolox.tools.eval -n yolox-s -c yolox_s.pth -b 64 -d 8 --conf 0.001 --eval-out YOLOX_outputs/yolox_s/eval
+```
+
+If you also want image-wise prediction results in JSON format:
+
+```shell
+python -m yolox.tools.eval -n yolox-s -c yolox_s.pth -b 64 -d 8 --conf 0.001 --eval-out YOLOX_outputs/yolox_s/eval --save-predictions
+```
+
+New options:
+* --eval-out: output directory for evaluation artifacts.
+* --save-predictions: save image-wise predictions to `predictions.json` under `--eval-out`.
+
+By default (without these options), behavior is unchanged and results are printed/logged as before.
+
+When using `scripts/run_eval_yolox-tiny.sh`, you can switch mode with `EVAL_MODE`:
+* `EVAL_MODE=""`: standard output/log only (default).
+* `EVAL_MODE="file"`: enable file output with `--eval-out` and `--save-predictions`.
+
 To reproduce speed test, we use the following command:
 ```shell
 python -m yolox.tools.eval -n  yolox-s -c yolox_s.pth -b 1 -d 1 --conf 0.001 --fp16 --fuse
@@ -201,6 +225,14 @@ python -m yolox.tools.eval -n  yolox-s -c yolox_s.pth -b 1 -d 1 --conf 0.001 --f
                                yolox-l
                                yolox-x
 ```
+
+### Planned extensions
+
+The current file output is designed as a base for future extensibility.
+Planned additions include:
+* per-image richer inference artifacts (additional structured fields in JSON).
+* optional intermediate feature-map export under the same `--eval-out` directory.
+* writer-based extension points to add new artifact types while keeping existing evaluation flow unchanged.
 
 </details>
 

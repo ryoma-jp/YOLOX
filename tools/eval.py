@@ -6,6 +6,7 @@ import argparse
 import os
 import random
 import warnings
+from datetime import datetime
 from loguru import logger
 
 import torch
@@ -14,6 +15,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from yolox.core import launch
 from yolox.exp import get_exp
+from yolox.evaluators import PredictionWriter, SummaryWriter
 from yolox.utils import (
     configure_module,
     configure_nccl,
@@ -104,6 +106,19 @@ def make_parser():
         help="speed test only.",
     )
     parser.add_argument(
+        "--eval-out",
+        default=None,
+        type=str,
+        help="directory to write evaluation artifacts.",
+    )
+    parser.add_argument(
+        "--save-predictions",
+        dest="save_predictions",
+        default=False,
+        action="store_true",
+        help="save image-wise predictions to eval-out/predictions.json.",
+    )
+    parser.add_argument(
         "opts",
         help="Modify config options using the command-line",
         default=None,
@@ -189,11 +204,53 @@ def main(exp, args, num_gpu):
         trt_file = None
         decoder = None
 
+    eval_out_dir = args.eval_out
+    if eval_out_dir is not None and rank == 0:
+        os.makedirs(eval_out_dir, exist_ok=True)
+
+    if args.save_predictions and eval_out_dir is None:
+        logger.warning("--save-predictions requires --eval-out. Predictions will not be saved.")
+
+    if args.save_predictions and eval_out_dir is not None:
+        evaluator.prediction_dump_path = os.path.join(eval_out_dir, "coco_testdev_predictions.json")
+
     # start evaluate
-    *_, summary = evaluator.evaluate(
-        model, is_distributed, args.fp16, trt_file, decoder, exp.test_size
+    return_outputs = args.save_predictions and eval_out_dir is not None
+    eval_result = evaluator.evaluate(
+        model, is_distributed, args.fp16, trt_file, decoder, exp.test_size, return_outputs=return_outputs
     )
+    if return_outputs:
+        (ap50_95, ap50, summary), output_data = eval_result
+    else:
+        ap50_95, ap50, summary = eval_result
+        output_data = None
+
     logger.info("\n" + summary)
+
+    if rank == 0 and eval_out_dir is not None:
+        metadata = {
+            "experiment_name": args.experiment_name,
+            "exp_file": args.exp_file,
+            "checkpoint": args.ckpt,
+            "batch_size": args.batch_size,
+            "devices": args.devices,
+            "testdev": args.test,
+            "conf": exp.test_conf,
+            "nms": exp.nmsthre,
+            "test_size": list(exp.test_size),
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        summary_writer = SummaryWriter(eval_out_dir)
+        summary_artifacts = summary_writer.write(summary, ap50_95, ap50, metadata=metadata)
+        logger.info("Saved evaluation summary to {} and {}".format(
+            summary_artifacts["summary_path"], summary_artifacts["metrics_path"]
+        ))
+
+        if args.save_predictions and output_data is not None:
+            prediction_writer = PredictionWriter(eval_out_dir)
+            prediction_artifacts = prediction_writer.write(output_data, metadata=metadata)
+            logger.info("Saved evaluation predictions to {}".format(prediction_artifacts["predictions_path"]))
 
 
 if __name__ == "__main__":

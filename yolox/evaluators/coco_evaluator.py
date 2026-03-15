@@ -112,6 +112,7 @@ class COCOEvaluator:
         self.testdev = testdev
         self.per_class_AP = per_class_AP
         self.per_class_AR = per_class_AR
+        self.prediction_dump_path = "./yolox_testdev_2017.json"
 
     def evaluate(
         self, model, distributed=False, half=False, trt_file=None,
@@ -284,11 +285,13 @@ class COCOEvaluator:
             cocoGt = self.dataloader.dataset.coco
             # TODO: since pycocotools can't process dict in py36, write data to json file.
             if self.testdev:
-                json.dump(data_dict, open("./yolox_testdev_2017.json", "w"))
-                cocoDt = cocoGt.loadRes("./yolox_testdev_2017.json")
+                with open(self.prediction_dump_path, "w") as f:
+                    json.dump(data_dict, f)
+                cocoDt = cocoGt.loadRes(self.prediction_dump_path)
             else:
                 _, tmp = tempfile.mkstemp()
-                json.dump(data_dict, open(tmp, "w"))
+                with open(tmp, "w") as f:
+                    json.dump(data_dict, f)
                 cocoDt = cocoGt.loadRes(tmp)
             try:
                 from yolox.layers import COCOeval_opt as COCOeval
