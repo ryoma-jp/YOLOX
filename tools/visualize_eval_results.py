@@ -52,6 +52,13 @@ def make_parser():
         help="IoU threshold for per-class NMS. Set a negative value to disable NMS.",
     )
     parser.add_argument(
+        "--annotations-path",
+        type=str,
+        default=None,
+        help="path to COCO-format annotations JSON (e.g. instances_val2017.json). "
+             "If provided, GT boxes are rendered as gt_{filename} alongside det_{filename}.",
+    )
+    parser.add_argument(
         "--mode",
         type=str,
         default="boxes",
@@ -69,6 +76,21 @@ def make_parser():
         help="reserved for mode=features|both: feature layer names to export",
     )
     return parser
+
+
+def _load_annotations(annotations_path: str) -> Dict[str, List[dict]]:
+    """Load a COCO-format annotations JSON and return a dict keyed by str(image_id)."""
+    with open(annotations_path, "r", encoding="utf-8") as f:
+        coco = json.load(f)
+
+    if "annotations" not in coco:
+        raise ValueError("Invalid annotations file: missing 'annotations' key")
+
+    index: Dict[str, List[dict]] = {}
+    for ann in coco["annotations"]:
+        key = str(ann["image_id"])
+        index.setdefault(key, []).append(ann)
+    return index
 
 
 def _load_predictions(predictions_path: str):
@@ -198,6 +220,41 @@ def _filter_predictions_for_draw(pred: dict, conf_threshold: float, nms_iou_thre
     return list(zip(boxes.tolist(), scores.tolist(), categories.tolist()))
 
 
+def _draw_gt_boxes(image: np.ndarray, gt_entries: List[dict]) -> np.ndarray:
+    """Draw Ground-Truth boxes (COCO xywh format) onto image."""
+    for ann in gt_entries:
+        bbox = ann.get("bbox")
+        category_id = ann.get("category_id")
+        if not bbox or len(bbox) != 4 or category_id is None:
+            continue
+
+        # COCO bbox is [x, y, w, h] → convert to xyxy
+        x0 = int(bbox[0])
+        y0 = int(bbox[1])
+        x1 = int(bbox[0] + bbox[2])
+        y1 = int(bbox[1] + bbox[3])
+
+        color = _category_color(int(category_id))
+        label = "gt_id{}".format(int(category_id))
+
+        cv2.rectangle(image, (x0, y0), (x1, y1), color, 3)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        text_y0 = max(0, y0 - th - 4)
+        cv2.rectangle(image, (x0, text_y0), (x0 + tw + 4, text_y0 + th + 4), color, -1)
+        cv2.putText(
+            image,
+            label,
+            (x0 + 2, text_y0 + th + 1),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return image
+
+
 def _draw_boxes(image: np.ndarray, pred: dict, conf_threshold: float, nms_iou_threshold: float):
     filtered_predictions = _filter_predictions_for_draw(pred, conf_threshold, nms_iou_threshold)
 
@@ -227,8 +284,13 @@ def _draw_boxes(image: np.ndarray, pred: dict, conf_threshold: float, nms_iou_th
     return image
 
 
-def _render_boxes_mode(predictions: Dict[str, dict], images_meta: Dict[str, dict], image_ids: List[str], args):
-    os.makedirs(args.output_dir, exist_ok=True)
+def _render_boxes_mode(
+    predictions: Dict[str, dict],
+    images_meta: Dict[str, dict],
+    image_ids: List[str],
+    gt_index: Dict[str, List[dict]],
+    args,
+):
     rendered_count = 0
 
     for image_id_key in image_ids:
@@ -243,11 +305,22 @@ def _render_boxes_mode(predictions: Dict[str, dict], images_meta: Dict[str, dict
             logger.warning("Skip image_id={} because source image was not found: {}", image_id_key, image_path)
             continue
 
-        vis_image = _draw_boxes(image, pred, args.conf_threshold, args.nms_iou_threshold)
         safe_file_name = os.path.basename(file_name)
-        out_name = "{}_{}".format(image_id_key, safe_file_name)
-        out_path = os.path.join(args.output_dir, out_name)
-        cv2.imwrite(out_path, vis_image)
+        per_image_dir = os.path.join(args.output_dir, image_id_key)
+        os.makedirs(per_image_dir, exist_ok=True)
+
+        # Prediction image: det_{filename}
+        det_image = _draw_boxes(image.copy(), pred, args.conf_threshold, args.nms_iou_threshold)
+        det_path = os.path.join(per_image_dir, "det_{}".format(safe_file_name))
+        cv2.imwrite(det_path, det_image)
+
+        # GT image: gt_{filename} (only when annotations were provided)
+        if gt_index is not None:
+            gt_entries = gt_index.get(image_id_key, [])
+            gt_image = _draw_gt_boxes(image.copy(), gt_entries)
+            gt_path = os.path.join(per_image_dir, "gt_{}".format(safe_file_name))
+            cv2.imwrite(gt_path, gt_image)
+
         rendered_count += 1
 
     logger.info("Rendered {} images into {}", rendered_count, args.output_dir)
@@ -269,8 +342,13 @@ def main():
 
     image_ids = _select_image_ids(predictions, args.image_id)
 
+    gt_index = None
+    if args.annotations_path is not None:
+        gt_index = _load_annotations(args.annotations_path)
+        logger.info("Loaded GT annotations from {}", args.annotations_path)
+
     if args.mode == "boxes":
-        _render_boxes_mode(predictions, images_meta, image_ids, args)
+        _render_boxes_mode(predictions, images_meta, image_ids, gt_index, args)
         return
 
     # Keep extension hook explicit: feature modes are model-dependent and may rerun inference.

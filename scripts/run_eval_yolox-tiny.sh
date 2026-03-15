@@ -17,6 +17,7 @@ if [ "$EVAL_MODE" = "file" ]; then
             --conf-threshold 0.3 \
             --nms-iou-threshold 0.5 \
             --images-dir datasets/COCO/val2017 \
+            --annotations-path datasets/COCO/annotations/instances_val2017.json \
             --output-dir YOLOX_outputs/yolox_tiny/eval/vis_res \
             --image-id 397133
 else
