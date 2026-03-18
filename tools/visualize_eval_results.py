@@ -517,6 +517,11 @@ def _render_boxes_mode(
                 model_input_shape=tuple(model_input.shape),
             )
 
+            input_array = model_input.detach().cpu().float().numpy()
+            if input_array.ndim == 4 and input_array.shape[0] == 1:
+                input_array = input_array[0]
+            np.save(os.path.join(per_image_dir, "input_tensor.npy"), input_array)
+
         rendered_count += 1
 
     logger.info("Rendered {} images with detection overlays and feature npy into {}", rendered_count, args.output_dir)
