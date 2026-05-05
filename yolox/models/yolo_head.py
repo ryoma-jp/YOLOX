@@ -575,6 +575,348 @@ class YOLOXHead(nn.Module):
         ]
         return num_fg, gt_matched_classes, pred_ious_this_matching, matched_gt_inds
 
+    def get_per_object_losses(
+        self,
+        imgs,
+        x_shifts,
+        y_shifts,
+        expanded_strides,
+        labels,
+        outputs,
+        origin_preds,
+        dtype,
+    ):
+        """Compute per-GT-object losses using SimOTA assignment.
+
+        Returns a list of dicts (one per batch item):
+            {
+                "per_gt_losses": Tensor(n_gt,)  — scalar loss for each GT (backprop-able),
+                "fg_mask":       Tensor(n_anchors,) bool,
+                "matched_gt_inds": Tensor(n_fg,) long,
+            }
+        If an image has 0 GTs, returns None for that batch item.
+        """
+        bbox_preds = outputs[:, :, :4]
+        obj_preds  = outputs[:, :, 4:5]
+        cls_preds  = outputs[:, :, 5:]
+
+        nlabel = (labels.sum(dim=2) > 0).sum(dim=1)
+        total_num_anchors = outputs.shape[1]
+        x_shifts_cat       = torch.cat(x_shifts, 1)
+        y_shifts_cat       = torch.cat(y_shifts, 1)
+        expanded_strides_cat = torch.cat(expanded_strides, 1)
+        if self.use_l1:
+            origin_preds_cat = torch.cat(origin_preds, 1)
+
+        results = []
+        for batch_idx in range(outputs.shape[0]):
+            num_gt = int(nlabel[batch_idx])
+            if num_gt == 0:
+                results.append(None)
+                continue
+
+            gt_bboxes_per_image      = labels[batch_idx, :num_gt, 1:5]
+            gt_classes               = labels[batch_idx, :num_gt, 0]
+            bboxes_preds_per_image   = bbox_preds[batch_idx]
+
+            try:
+                (
+                    gt_matched_classes,
+                    fg_mask,
+                    pred_ious_this_matching,
+                    matched_gt_inds,
+                    num_fg_img,
+                ) = self.get_assignments(
+                    batch_idx,
+                    num_gt,
+                    gt_bboxes_per_image,
+                    gt_classes,
+                    bboxes_preds_per_image,
+                    expanded_strides_cat,
+                    x_shifts_cat,
+                    y_shifts_cat,
+                    cls_preds,
+                    obj_preds,
+                )
+            except RuntimeError as e:
+                if "CUDA out of memory. " not in str(e):
+                    raise
+                torch.cuda.empty_cache()
+                (
+                    gt_matched_classes,
+                    fg_mask,
+                    pred_ious_this_matching,
+                    matched_gt_inds,
+                    num_fg_img,
+                ) = self.get_assignments(
+                    batch_idx,
+                    num_gt,
+                    gt_bboxes_per_image,
+                    gt_classes,
+                    bboxes_preds_per_image,
+                    expanded_strides_cat,
+                    x_shifts_cat,
+                    y_shifts_cat,
+                    cls_preds,
+                    obj_preds,
+                    "cpu",
+                )
+            torch.cuda.empty_cache()
+
+            # Build targets (same as get_losses) to compute per-anchor loss
+            cls_target = F.one_hot(
+                gt_matched_classes.to(torch.int64), self.num_classes
+            ) * pred_ious_this_matching.unsqueeze(-1)
+            obj_target = fg_mask.unsqueeze(-1)
+            reg_target = gt_bboxes_per_image[matched_gt_inds]
+
+            fg_bbox_preds = bbox_preds[batch_idx][fg_mask]
+            fg_obj_preds  = obj_preds[batch_idx][fg_mask]
+            fg_cls_preds  = cls_preds[batch_idx][fg_mask]
+
+            # Per-anchor unreduced losses
+            per_anchor_iou  = self.iou_loss(fg_bbox_preds, reg_target)            # (n_fg,)
+            per_anchor_obj  = self.bcewithlog_loss(fg_obj_preds, obj_target[fg_mask].float()).squeeze(-1)  # (n_fg,)
+            per_anchor_cls  = self.bcewithlog_loss(fg_cls_preds, cls_target).sum(-1)  # (n_fg,)
+
+            if self.use_l1:
+                l1_target = self.get_l1_target(
+                    outputs.new_zeros((num_fg_img, 4)),
+                    gt_bboxes_per_image[matched_gt_inds],
+                    expanded_strides_cat[0][fg_mask],
+                    x_shifts=x_shifts_cat[0][fg_mask],
+                    y_shifts=y_shifts_cat[0][fg_mask],
+                )
+                fg_origin = origin_preds_cat[batch_idx][fg_mask]
+                per_anchor_l1 = self.l1_loss(fg_origin, l1_target).sum(-1)        # (n_fg,)
+            else:
+                per_anchor_l1 = torch.zeros_like(per_anchor_iou)
+
+            per_anchor_total = 5.0 * per_anchor_iou + per_anchor_obj + per_anchor_cls + per_anchor_l1  # (n_fg,)
+
+            # Aggregate per-GT: sum over anchors assigned to each GT, normalise by n_fg
+            num_fg_norm = max(float(num_fg_img), 1.0)
+            per_gt_losses = outputs.new_zeros(num_gt)
+            for gt_k in range(num_gt):
+                anchor_mask = matched_gt_inds == gt_k
+                if anchor_mask.any():
+                    per_gt_losses[gt_k] = per_anchor_total[anchor_mask].sum() / num_fg_norm
+
+            results.append({
+                "per_gt_losses":   per_gt_losses,          # Tensor(n_gt,)  backprop-able
+                "fg_mask":         fg_mask,                 # Tensor(n_anchors,) bool, no-grad
+                "matched_gt_inds": matched_gt_inds,         # Tensor(n_fg,) long, no-grad
+            })
+        return results
+
+    def compute_fn_losses(
+        self,
+        batch_idx,
+        fn_gt_indices,
+        gt_bboxes_per_image,
+        gt_classes,
+        outputs,
+        x_shifts,
+        y_shifts,
+        expanded_strides,
+        origin_preds,
+        fg_mask,
+        tau_fn=0.1,
+    ):
+        """Compute losses for FN GT objects using SimOTA re-run on free anchors.
+
+        Free anchors are those NOT in fg_mask from the normal SimOTA pass.
+        For each FN GT k, we re-run SimOTA cost matrix on free anchors only.
+
+        Args:
+            batch_idx:           Index into the batch dimension.
+            fn_gt_indices:       List[int] of GT indices that are FN.
+            gt_bboxes_per_image: Tensor(n_gt, 4) cxcywh in model-input coords.
+            gt_classes:          Tensor(n_gt,) long.
+            outputs:             Raw model output Tensor(B, n_anchors, 5+C).
+            x_shifts, y_shifts, expanded_strides: from forward pass (list of tensors).
+            origin_preds:        List of origin pred tensors (for L1 loss). May be None.
+            fg_mask:             Tensor(n_anchors,) bool — anchors already assigned.
+            tau_fn:              Min IoU threshold; skip FN GT if max_iou < tau_fn.
+
+        Returns:
+            List[Optional[Tensor]] — one scalar loss per fn_gt_indices entry.
+            None means the GT was unresolvable (log it externally).
+        """
+        if len(fn_gt_indices) == 0:
+            return []
+
+        x_shifts_cat         = torch.cat(x_shifts, 1)
+        y_shifts_cat         = torch.cat(y_shifts, 1)
+        expanded_strides_cat = torch.cat(expanded_strides, 1)
+        if self.use_l1 and origin_preds is not None:
+            origin_preds_cat = torch.cat(origin_preds, 1)
+        else:
+            origin_preds_cat = None
+
+        bbox_preds = outputs[:, :, :4]
+        obj_preds  = outputs[:, :, 4:5]
+        cls_preds  = outputs[:, :, 5:]
+
+        # All free anchors (not yet assigned)
+        free_mask = ~fg_mask                          # Tensor(n_anchors,) bool
+        if free_mask.sum() == 0:
+            return [None] * len(fn_gt_indices)
+
+        free_bbox_preds = bbox_preds[batch_idx][free_mask]  # (n_free, 4)
+        free_cls_preds  = cls_preds[batch_idx][free_mask]   # (n_free, n_cls)
+        free_obj_preds  = obj_preds[batch_idx][free_mask]   # (n_free, 1)
+        free_x_shifts   = x_shifts_cat[0][free_mask]
+        free_y_shifts   = y_shifts_cat[0][free_mask]
+        free_strides    = expanded_strides_cat[0][free_mask]
+
+        n_free = free_mask.sum().item()
+
+        # For each FN GT: compute cost, dynamic_k, candidate anchors
+        # Then resolve conflicts (each free anchor → at most one FN GT, lowest cost wins)
+        fn_gt_costs   = {}  # gt_k -> Tensor(n_free,)
+        fn_gt_dk      = {}  # gt_k -> int
+        fn_gt_ious    = {}  # gt_k -> Tensor(n_free,)
+
+        for gt_k in fn_gt_indices:
+            gt_box_k = gt_bboxes_per_image[gt_k:gt_k+1]   # (1, 4)
+
+            # Geometry constraint on free anchors
+            center_radius = 1.5
+            center_dist = free_strides * center_radius
+            gt_cx, gt_cy = float(gt_box_k[0, 0]), float(gt_box_k[0, 1])
+            c_l = (free_x_shifts + 0.5) * free_strides - (gt_cx - center_dist)
+            c_r = (gt_cx + center_dist) - (free_x_shifts + 0.5) * free_strides
+            c_t = (free_y_shifts + 0.5) * free_strides - (gt_cy - center_dist)
+            c_b = (gt_cy + center_dist) - (free_y_shifts + 0.5) * free_strides
+            in_center = torch.stack([c_l, c_t, c_r, c_b], 1).min(dim=1).values > 0.0
+
+            if in_center.sum() == 0:
+                fn_gt_costs[gt_k]  = None
+                fn_gt_dk[gt_k]     = 0
+                fn_gt_ious[gt_k]   = None
+                continue
+
+            cand_bbox  = free_bbox_preds[in_center]
+            cand_cls   = free_cls_preds[in_center]
+            cand_obj   = free_obj_preds[in_center]
+            n_cand     = cand_bbox.shape[0]
+
+            pair_ious = bboxes_iou(gt_box_k, cand_bbox, False).squeeze(0)   # (n_cand,)
+            if float(pair_ious.max().item()) < tau_fn:
+                fn_gt_costs[gt_k]  = None
+                fn_gt_dk[gt_k]     = 0
+                fn_gt_ious[gt_k]   = None
+                continue
+
+            pair_ious_loss = -torch.log(pair_ious + 1e-8)
+
+            gt_cls_onehot = F.one_hot(
+                gt_classes[gt_k:gt_k+1].to(torch.int64), self.num_classes
+            ).float()  # (1, n_cls)
+
+            with torch.cuda.amp.autocast(enabled=False):
+                cand_cls_f   = (cand_cls.float().sigmoid() * cand_obj.float().sigmoid()).sqrt()
+                pair_cls_loss = F.binary_cross_entropy(
+                    cand_cls_f.unsqueeze(0),
+                    gt_cls_onehot.unsqueeze(1).expand(-1, n_cand, -1),
+                    reduction="none",
+                ).sum(-1).squeeze(0)   # (n_cand,)
+
+            cost = pair_cls_loss + 3.0 * pair_ious_loss + 1e6 * (~in_center[in_center]).float()
+            # in_center[in_center] is all True, so geometry penalty is 0
+
+            n_cand_k = min(10, pair_ious.shape[0])
+            topk_ious, _ = torch.topk(pair_ious.unsqueeze(0), n_cand_k, dim=1)
+            dynamic_k = int(torch.clamp(topk_ious.sum(1).int(), min=1).item())
+
+            # Map cost back to full free_mask index space
+            full_cost = torch.full((n_free,), float('inf'), device=outputs.device)
+            full_cost[in_center] = cost
+            full_iou  = torch.zeros(n_free, device=outputs.device)
+            full_iou[in_center]  = pair_ious
+
+            fn_gt_costs[gt_k] = full_cost
+            fn_gt_dk[gt_k]    = dynamic_k
+            fn_gt_ious[gt_k]  = full_iou
+
+        # Conflict resolution: each free anchor → lowest-cost FN GT only
+        # Build assignment: fn_anchor_assignment[free_idx] = gt_k or -1
+        fn_anchor_assignment = torch.full((n_free,), -1, dtype=torch.long, device=outputs.device)
+        fn_anchor_min_cost   = torch.full((n_free,), float('inf'), device=outputs.device)
+
+        fn_gt_selected_indices = {}  # gt_k -> Tensor of free_mask indices (within free anchors)
+        for gt_k in fn_gt_indices:
+            if fn_gt_costs[gt_k] is None or fn_gt_dk[gt_k] == 0:
+                fn_gt_selected_indices[gt_k] = None
+                continue
+            cost_k = fn_gt_costs[gt_k]
+            dk     = fn_gt_dk[gt_k]
+            _, top_indices = torch.topk(cost_k, k=min(dk, (cost_k < float('inf')).sum().item()), largest=False)
+
+            for idx in top_indices:
+                i = int(idx.item())
+                c = float(cost_k[i].item())
+                if c < float(fn_anchor_min_cost[i].item()):
+                    if fn_anchor_assignment[i] != -1:
+                        # Remove previous assignment
+                        prev_gt = int(fn_anchor_assignment[i].item())
+                        if prev_gt in fn_gt_selected_indices and fn_gt_selected_indices[prev_gt] is not None:
+                            fn_gt_selected_indices[prev_gt] = None  # will recompute below
+                    fn_anchor_assignment[i] = gt_k
+                    fn_anchor_min_cost[i]   = c
+
+        # Recompute final per-GT anchor sets from fn_anchor_assignment
+        for gt_k in fn_gt_indices:
+            assigned = (fn_anchor_assignment == gt_k).nonzero(as_tuple=False).squeeze(1)
+            fn_gt_selected_indices[gt_k] = assigned if assigned.numel() > 0 else None
+
+        # Compute losses
+        fn_losses = []
+        for gt_k in fn_gt_indices:
+            sel = fn_gt_selected_indices[gt_k]
+            if sel is None or sel.numel() == 0:
+                fn_losses.append(None)
+                continue
+
+            # Map free-anchor local indices to global anchor indices
+            free_global_indices = free_mask.nonzero(as_tuple=False).squeeze(1)[sel]
+
+            fn_bbox  = bbox_preds[batch_idx][free_global_indices]
+            fn_obj   = obj_preds[batch_idx][free_global_indices]
+            fn_cls   = cls_preds[batch_idx][free_global_indices]
+
+            reg_target = gt_bboxes_per_image[gt_k:gt_k+1].expand(sel.numel(), -1)
+            cls_target = (
+                F.one_hot(gt_classes[gt_k:gt_k+1].to(torch.int64), self.num_classes).float()
+            ).expand(sel.numel(), -1)
+            obj_target = torch.ones(sel.numel(), 1, device=outputs.device, dtype=outputs.dtype)
+
+            n_norm = max(float(sel.numel()), 1.0)
+            loss_iou = self.iou_loss(fn_bbox, reg_target).sum() / n_norm
+            loss_obj = self.bcewithlog_loss(fn_obj, obj_target).sum() / n_norm
+            loss_cls = self.bcewithlog_loss(fn_cls, cls_target).sum(-1).sum() / n_norm
+
+            if self.use_l1 and origin_preds_cat is not None:
+                fn_origin  = origin_preds_cat[batch_idx][free_global_indices]
+                fn_strides = free_strides[sel]
+                fn_x       = free_x_shifts[sel]
+                fn_y       = free_y_shifts[sel]
+                l1_target  = self.get_l1_target(
+                    outputs.new_zeros((sel.numel(), 4)),
+                    gt_bboxes_per_image[gt_k:gt_k+1].expand(sel.numel(), -1),
+                    fn_strides,
+                    x_shifts=fn_x,
+                    y_shifts=fn_y,
+                )
+                loss_l1 = self.l1_loss(fn_origin, l1_target).sum(-1).sum() / n_norm
+            else:
+                loss_l1 = 0.0
+
+            fn_losses.append(5.0 * loss_iou + loss_obj + loss_cls + loss_l1)
+
+        return fn_losses
+
     def visualize_assign_result(self, xin, labels=None, imgs=None, save_prefix="assign_vis_"):
         # original forward logic
         outputs, x_shifts, y_shifts, expanded_strides = [], [], [], []
